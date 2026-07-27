@@ -1,0 +1,6 @@
+# PrintBridge 依赖
+# 微信桥接通过 uiautomation 直接实现, 无需 wxauto
+uiautomation>=2.0.0
+pystray>=0.19.0
+Pillow>=10.0.0
+pywin32>=306

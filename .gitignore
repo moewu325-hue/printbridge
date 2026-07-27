@@ -1,0 +1,33 @@
+# Build
+build/
+dist/
+*.spec.bak
+
+# Runtime
+config.json
+print_history.db
+logs/
+temp/
+__pycache__/
+*.pyc
+*.pyo
+
+# Virtual env
+venv/
+env/
+.venv/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# PyInstaller
+*.manifest
+*.exe
