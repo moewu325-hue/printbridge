@@ -4,10 +4,11 @@
 
 ## 2026-10-22 本机结果
 
-- Windows x64 / Python 3.11.5：`scripts/build.ps1` 完成，143项unittest全部通过；启动异常日志来自故障注入用例。
+- Windows x64 / Python 3.11.5：`scripts/build.ps1` 完成；发行路径回归加入后144项unittest全部通过，启动异常日志来自故障注入用例。
 - 源码入口及冻结EXE均以独立目录执行烟测，退出码0；`ok`、`monitor_running`、`stopped`为true，`wechat_started`为false。真实托盘已显示并随退出停止。
 - 发行EXE为23,445,403字节；检查冻结包确实包含UIAutomation的x64/x86 DLL及17份第三方许可文本。构建时ctypes静态查找的DLL警告不表示它们未收录。
 - Git跟踪源码及原有历史已扫描凭据模式与运行数据，未发现匹配；源码ZIP另验真实成员与逐文件SHA256。
+- CI首次发现临时目录的Windows短路径未归一化，已用本机真实8.3路径复现并修复；打包前将根目录与成员统一为解析后的路径，越界拒绝逻辑保留。
 
 源码和EXE的界面、生命周期结果在本机验证；GitHub Windows CI另行运行相同构建与冻结烟测。
 

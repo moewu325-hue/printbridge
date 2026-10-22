@@ -14,6 +14,18 @@ spec.loader.exec_module(builder)
 
 
 class ReleaseTests(unittest.TestCase):
+    def test_root_alias_is_normalized_before_containment_check(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / 'nested').mkdir()
+            (root / 'icon.png').write_bytes(b'icon')
+            alias = root / 'nested' / '..'
+            with patch.object(builder, 'ROOT', alias), patch.object(builder.subprocess, 'check_output', return_value=b'icon.png\0'):
+                output = root / 'alias.zip'
+                builder.build(output)
+            with zipfile.ZipFile(output) as archive:
+                self.assertEqual(archive.read('PrintBridge/icon.png'), b'icon')
+
     def test_archive_is_deterministic_and_every_member_has_checksum(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

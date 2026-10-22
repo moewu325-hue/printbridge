@@ -9,19 +9,20 @@ ROOT = Path(__file__).resolve().parents[1]
 
 
 def build(output):
-    names = subprocess.check_output(['git', '-C', str(ROOT), 'ls-files', '-z']).decode('utf-8').split('\0')
+    root = ROOT.resolve()
+    names = subprocess.check_output(['git', '-C', str(root), 'ls-files', '-z']).decode('utf-8').split('\0')
     names = sorted(name for name in names if name)
     output = Path(output).resolve()
     inputs = {}
     for name in names:
-        path = ROOT / name
+        path = root / name
         parts = PurePosixPath(name).parts
         if (PurePosixPath(name).is_absolute() or '..' in parts or ':' in name
                 or any(x in parts for x in ('.git', 'build', 'dist', 'logs', 'temp', '.venv', '__pycache__'))
                 or path.name in ('config.json', 'print_history.db')
                 or path.suffix.lower() in ('.exe', '.key', '.pem', '.pyc')
                 or path.name.startswith('.env') or path.is_symlink()
-                or not path.resolve().is_relative_to(ROOT)):
+                or not path.resolve().is_relative_to(root)):
             raise ValueError('禁止打包的输入: ' + name)
         if path.resolve() == output:
             raise ValueError('发行输出不可覆盖源码')
