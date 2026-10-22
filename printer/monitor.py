@@ -1,227 +1,286 @@
-"""打印监控核心: EnumJobs轮询 + 状态解码 + 变更检测"""
-import time
+"""打印队列完整快照轮询与可恢复状态跟踪。"""
 import threading
-import win32print
-import win32api
 from datetime import datetime
 from typing import Optional
 
+import win32print
 
-# 状态位掩码 → 可读状态 (优先级从高到低)
+from printer.controller import enumerate_jobs
+
+
 STATUS_MAP = [
-    (win32print.JOB_STATUS_ERROR, "error"),
-    (win32print.JOB_STATUS_PAPEROUT, "paperout"),
-    (win32print.JOB_STATUS_OFFLINE, "offline"),
-    (win32print.JOB_STATUS_DELETING, "cancelling"),
-    (win32print.JOB_STATUS_PAUSED, "paused"),
-    (win32print.JOB_STATUS_PRINTING, "printing"),
-    (win32print.JOB_STATUS_SPOOLING, "spooling"),
-    (win32print.JOB_STATUS_PRINTED, "printed"),
+    (win32print.JOB_STATUS_DELETED, 'cancelled'),
+    (win32print.JOB_STATUS_DELETING, 'cancelling'),
+    (win32print.JOB_STATUS_ERROR, 'error'),
+    (win32print.JOB_STATUS_PAPEROUT, 'paperout'),
+    (win32print.JOB_STATUS_OFFLINE, 'offline'),
+    (win32print.JOB_STATUS_PRINTED, 'printed'),
+    (win32print.JOB_STATUS_PAUSED, 'paused'),
+    (win32print.JOB_STATUS_PRINTING, 'printing'),
+    (win32print.JOB_STATUS_SPOOLING, 'spooling'),
+    (win32print.JOB_STATUS_COMPLETE, 'sent'),
 ]
-
-# 终态: 作业已结束, 可触发通知
-FINAL_STATUSES = {"printed", "error", "paperout", "offline", "cancelled"}
+FINAL_STATUSES = {'printed', 'cancelled', 'removed'}
+NOTIFY_STATUSES = FINAL_STATUSES | {'error', 'paperout', 'offline'}
+PRINTER_STATUS_MAP = [
+    (win32print.PRINTER_STATUS_OFFLINE, '脱机'),
+    (win32print.PRINTER_STATUS_ERROR, '错误'),
+    (win32print.PRINTER_STATUS_PAPER_OUT, '缺纸'),
+    (win32print.PRINTER_STATUS_PAPER_JAM, '卡纸'),
+    (win32print.PRINTER_STATUS_PAUSED, '暂停'),
+    (win32print.PRINTER_STATUS_USER_INTERVENTION, '需要人工处理'),
+    (win32print.PRINTER_STATUS_PRINTING, '打印中'),
+    (win32print.PRINTER_STATUS_BUSY, '忙碌'),
+]
 
 
 def decode_status(status_code: int) -> str:
-    """将win32print Status位掩码解码为可读状态字符串"""
-    if status_code == 0:
-        return "spooling"
+    if not status_code:
+        return 'spooling'
     for flag, text in STATUS_MAP:
         if status_code & flag:
             return text
-    return "unknown"
+    return 'unknown'
 
 
 def parse_job(raw_job: dict, printer_name: str) -> dict:
-    """将EnumJobs原始字典转为标准PrintJob字典"""
-    submitted = raw_job.get("Submitted")
+    submitted = raw_job.get('Submitted')
     if submitted:
         try:
-            submitted_str = submitted.strftime("%Y-%m-%d %H:%M:%S")
+            submitted = submitted.strftime('%Y-%m-%d %H:%M:%S')
         except AttributeError:
-            submitted_str = str(submitted)
+            submitted = str(submitted)
     else:
-        submitted_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-
+        submitted = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
     return {
-        "job_id": raw_job.get("JobId", 0),
-        "printer_name": printer_name,
-        "document": raw_job.get("pDocument", "未知文档"),
-        "status": decode_status(raw_job.get("Status", 0)),
-        "pages": raw_job.get("TotalPages", 0) or 0,
-        "submitted_time": submitted_str,
-        "owner": raw_job.get("pUserName", ""),
+        'job_id': raw_job.get('JobId', 0),
+        'printer_name': printer_name,
+        'document': raw_job.get('pDocument') or '未知文档',
+        'status': decode_status(raw_job.get('Status', 0)),
+        'pages': raw_job.get('TotalPages', 0) or 0,
+        'submitted_time': submitted,
+        'owner': raw_job.get('pUserName') or '',
     }
 
 
 class PrintMonitor:
-    """打印队列监控器: daemon线程轮询EnumJobs"""
+    """工作线程独占Win32句柄；外部请求只更新代际和唤醒事件。"""
 
     def __init__(self, printer_name: str, poll_interval: float,
                  job_queue, notify_queue, db, logger):
         self.printer_name = printer_name
         self.poll_interval = poll_interval
-        self.job_queue = job_queue       # SafeQueue → GUI
-        self.notify_queue = notify_queue  # SafeQueue → Notifier
+        self.job_queue = job_queue
+        self.notify_queue = notify_queue
         self.db = db
         self.logger = logger
         self.running = False
+        self.printer_status = '未连接'
         self._h_printer = None
-        self._known_jobs: dict[int, dict] = {}  # job_id → job dict
+        self._handle_generation = -1
+        self._known_jobs: dict[int, dict] = {}
+        self._printer_jobs = {printer_name: self._known_jobs}
+        self._pending_jobs = {}
+        self._displayed_records = set()
         self._thread: Optional[threading.Thread] = None
-        self.printer_status = "就绪"
-        self._fail_count = 0
-        self._auto_switch_callback = None  # 自动切换回调, 通知config_mgr更新
+        self._lock = threading.RLock()
+        self._stop_event = threading.Event()
+        self._wake_event = threading.Event()
+        self._generation = 0
+        self._auto_switch_callback = None
 
     def start(self):
-        """启动监控线程"""
-        self.running = True
-        self._thread = threading.Thread(
-            target=self._poll_loop, name="PrintMonitor", daemon=True
-        )
-        self._thread.start()
-        self.logger.info(f"打印监控已启动: {self.printer_name} (间隔{self.poll_interval}s)")
+        with self._lock:
+            if self._thread and self._thread.is_alive():
+                return
+            self._stop_event.clear()
+            self._wake_event.clear()
+            self.running = True
+            self._thread = threading.Thread(target=self._poll_loop,
+                                            name='PrintMonitor', daemon=True)
+            self._thread.start()
+        self.logger.info(f'打印监控已启动: {self.printer_name}')
 
     def stop(self):
-        """停止监控"""
-        self.running = False
-        if self._thread and self._thread.is_alive():
-            self._thread.join(timeout=5)
-        self._close_printer()
-        self.logger.info("打印监控已停止")
+        with self._lock:
+            self._stop_event.set()
+            self._wake_event.set()
+            worker = self._thread
+            self.printer_status = '正在停止'
+        if worker and worker is not threading.current_thread():
+            worker.join(timeout=5)
+            if worker.is_alive():
+                self.logger.warning('打印驱动调用尚未返回，等待工作线程自行释放句柄')
+        elif worker is None:
+            self._close_printer()
+            self.running = False
+            self.printer_status = '已停止'
+        return worker is None or not worker.is_alive()
 
-    def _open_printer(self) -> bool:
-        """打开打印机句柄, 连续失败3次尝试自动切换"""
-        if self._h_printer:
-            return True
-        try:
-            self._h_printer = win32print.OpenPrinter(self.printer_name)
-            self._fail_count = 0  # 成功, 重置计数
-            return True
-        except Exception as e:
-            self._fail_count += 1
-            self.logger.warning(f"无法打开打印机 {self.printer_name}: {e} (失败{self._fail_count}次)")
-            self.printer_status = f"离线: {e}"
-
-            # 连续失败3次 → 尝试自动切换
-            if self._fail_count >= 3:
-                self._try_auto_switch()
-            return False
-
-    def _try_auto_switch(self):
-        """尝试自动切换到其他可用打印机"""
-        try:
-            from printer.controller import PrintController
-            printers = PrintController.get_all_printers()
-            # 找一个不是当前打印机且能打开的
-            for p in printers:
-                if p["name"] == self.printer_name:
-                    continue
-                try:
-                    h = win32print.OpenPrinter(p["name"])
-                    win32print.ClosePrinter(h)
-                    # 可用! 切换
-                    old_name = self.printer_name
-                    self.switch_printer(p["name"])
-                    self.logger.info(f"自动切换打印机: {old_name} → {p['name']}")
-                    if self._auto_switch_callback:
-                        self._auto_switch_callback(p["name"])
-                    return
-                except Exception:
-                    continue
-            self.logger.warning("未找到可用的替代打印机")
-        except Exception as e:
-            self.logger.error(f"自动切换失败: {e}")
+    def request_refresh(self):
+        self._wake_event.set()
 
     def set_auto_switch_callback(self, callback):
-        """设置自动切换回调, 用于通知config_mgr更新配置"""
+        """保留旧调用接口，连接失败不会更换用户选择。"""
         self._auto_switch_callback = callback
 
     def _close_printer(self):
-        """关闭打印机句柄"""
-        if self._h_printer:
+        handle = self._h_printer
+        self._h_printer = None
+        self._handle_generation = -1
+        if handle is not None:
             try:
-                win32print.ClosePrinter(self._h_printer)
+                win32print.ClosePrinter(handle)
             except Exception:
-                pass
-            self._h_printer = None
+                self.logger.exception('关闭打印机句柄失败')
 
     def _poll_loop(self):
-        """主轮询循环(运行在daemon线程)"""
-        while self.running:
-            if not self._open_printer():
-                time.sleep(5)  # 重试间隔
-                continue
+        try:
+            while not self._stop_event.is_set():
+                self._wake_event.clear()
+                failed = False
+                try:
+                    self._poll_once()
+                except Exception:
+                    failed = True
+                    self._close_printer()
+                    with self._lock:
+                        self.printer_status = '连接或读取失败，等待重试'
+                    self.logger.exception('打印队列轮询失败')
+                if self._stop_event.is_set():
+                    break
+                interval = 3 if failed else max(0.1, float(self.poll_interval))
+                self._wake_event.wait(interval)
+        finally:
+            self._close_printer()
+            with self._lock:
+                self.running = False
+                self.printer_status = '已停止'
 
-            try:
-                # EnumJobs: Level 2 = 详细信息 (JOB_INFO_2)
-                raw_jobs = win32print.EnumJobs(self._h_printer, 0, 99, 2)
-            except win32print.error as e:
-                self.logger.error(f"EnumJobs失败: {e}, 尝试重连...")
-                self._close_printer()
-                time.sleep(3)
-                continue
-
+    def _poll_once(self):
+        with self._lock:
+            self._flush_pending()
+            printer_name, generation = self.printer_name, self._generation
+        if self._handle_generation != generation:
+            self._close_printer()
+        if self._h_printer is None:
+            self._h_printer = win32print.OpenPrinter(printer_name)
+            self._handle_generation = generation
+        raw_jobs = enumerate_jobs(self._h_printer)
+        info = win32print.GetPrinter(self._h_printer, 2)
+        with self._lock:
+            # 切换或停止后，旧设备的结果不能进入当前队列和历史。
+            if generation != self._generation or self._stop_event.is_set():
+                return
+            status = info.get('Status', 0)
+            labels = [text for flag, text in PRINTER_STATUS_MAP if status & flag]
+            self.printer_status = ' / '.join(labels) if labels else ('就绪' if not status else f'状态码 {status}')
             current_ids = set()
-
             for raw in raw_jobs:
-                job = parse_job(raw, self.printer_name)
-                jid = job["job_id"]
+                job = parse_job(raw, printer_name)
+                jid = job['job_id']
                 current_ids.add(jid)
-
-                if jid not in self._known_jobs:
-                    # 新作业
+                previous = self._known_jobs.get(jid)
+                if previous and not raw.get('Submitted'):
+                    job['submitted_time'] = previous['submitted_time']
+                if previous and (previous['submitted_time'], previous['document']) != (job['submitted_time'], job['document']):
+                    self._remove_job(previous)
+                    self._known_jobs.pop(jid, None)
+                    previous = None
+                if previous is None:
+                    job['record_id'] = None
                     self._known_jobs[jid] = job
-                    self.job_queue.put(("NEW", job))
-                    self.db.add_job(
-                        job_id=jid, printer_name=self.printer_name,
-                        document_name=job["document"], owner=job.get("owner", ""),
-                        pages=job.get("pages", 0), status=job["status"],
-                        submitted_time=job["submitted_time"],
-                    )
-                    self.logger.info(f"新作业 #{jid}: {job['document']} [{job['status']}]")
+                    self._stage('NEW', job)
+                else:
+                    job['record_id'] = previous['record_id']
+                    # 同一提交身份的明确终态不会因驱动清零而倒退。
+                    if previous['status'] in FINAL_STATUSES:
+                        job['status'] = previous['status']
+                    if previous['status'] != job['status']:
+                        self._known_jobs[jid] = job
+                        self._stage('UPDATE', job)
+                    elif previous != job or job['record_id'] not in self._displayed_records:
+                        self._known_jobs[jid] = job
+                        self._publish('UPDATE', job)
+            self._flush_pending()
+            for jid in set(self._known_jobs) - current_ids:
+                self._remove_job(self._known_jobs[jid])
+                self._known_jobs.pop(jid, None)
 
-                elif self._known_jobs[jid]["status"] != job["status"]:
-                    # 状态变更
-                    old_status = self._known_jobs[jid]["status"]
-                    self._known_jobs[jid] = job
-                    self.job_queue.put(("UPDATE", job))
-                    self.db.update_job_status(jid, job["status"])
-                    self.logger.info(f"作业 #{jid}: {old_status} → {job['status']}")
+    @staticmethod
+    def _identity(job):
+        return (job['printer_name'], job['job_id'], job['submitted_time'], job['document'])
 
-                    # 终态 → 通知
-                    if job["status"] in FINAL_STATUSES:
-                        self.notify_queue.put(job)
+    def _stage(self, action, job):
+        # 先保存观察证据，数据库失败时下一轮重试同一状态。
+        self._pending_jobs[self._identity(job)] = (action, job)
 
-            # 检测消失的作业(已从队列移除)
-            gone = set(self._known_jobs.keys()) - current_ids
-            for jid in gone:
-                job = self._known_jobs.pop(jid)
-                # 标记为已完成(如果没有明确终态)
-                if job["status"] not in FINAL_STATUSES:
-                    job["status"] = "printed"
-                self.job_queue.put(("REMOVE", job))
-                self.db.update_job_status(jid, "printed")
-                self.notify_queue.put(job)
-                self.logger.info(f"作业 #{jid} 已完成: {job['document']}")
+    def _flush_pending(self):
+        for identity, (action, job) in list(self._pending_jobs.items()):
+            if job['record_id'] is None:
+                job['record_id'] = self.db.add_job(
+                    job_id=job['job_id'], printer_name=job['printer_name'],
+                    document_name=job['document'], owner=job['owner'],
+                    pages=job['pages'], status=job['status'],
+                    submitted_time=job['submitted_time'],
+                )
+            else:
+                self._persist(job)
+            del self._pending_jobs[identity]
+            self._publish(action, job)
+            self._notify(job)
+            if action == 'REMOVE':
+                cache = self._printer_jobs[job['printer_name']]
+                previous = cache.get(job['job_id'])
+                if previous and self._identity(previous) == identity:
+                    cache.pop(job['job_id'])
 
-            # 更新打印机状态
-            self.printer_status = "就绪" if self._h_printer else "离线"
-            time.sleep(self.poll_interval)
+    def _publish(self, action, job):
+        if job['printer_name'] != self.printer_name:
+            return
+        record_id = job['record_id']
+        if action == 'REMOVE':
+            self._displayed_records.discard(record_id)
+        elif record_id not in self._displayed_records:
+            action = 'NEW'
+            self._displayed_records.add(record_id)
+        self.job_queue.put((action, dict(job)))
+
+    def _persist(self, job):
+        self.db.update_job_status(job['job_id'], job['status'],
+                                  printer_name=job['printer_name'], record_id=job['record_id'])
+
+    def _notify(self, job):
+        if job['status'] in NOTIFY_STATUSES:
+            self.notify_queue.put(dict(job))
+
+    def _remove_job(self, previous):
+        job = dict(previous)
+        if job['status'] not in FINAL_STATUSES:
+            job['status'] = 'cancelled' if job['status'] == 'cancelling' else 'removed'
+            self._stage('REMOVE', job)
+            self._flush_pending()
+        else:
+            self._publish('REMOVE', job)
 
     def get_status_summary(self) -> dict:
-        """获取打印机状态摘要"""
-        return {
-            "printer": self.printer_name,
-            "status": self.printer_status,
-            "active_jobs": len(self._known_jobs),
-            "jobs": list(self._known_jobs.values()),
-        }
+        with self._lock:
+            return {
+                'printer': self.printer_name,
+                'status': self.printer_status,
+                'active_jobs': sum(job['status'] not in FINAL_STATUSES for job in self._known_jobs.values()),
+                'jobs': [dict(job) for job in self._known_jobs.values()],
+            }
 
     def switch_printer(self, new_printer: str):
-        """切换监控的打印机"""
-        self._close_printer()
-        self._known_jobs.clear()
-        self.printer_name = new_printer
-        self.logger.info(f"切换打印机: {new_printer}")
+        with self._lock:
+            if new_printer == self.printer_name:
+                return
+            self._generation += 1
+            self.printer_name = new_printer
+            self._known_jobs = self._printer_jobs.setdefault(new_printer, {})
+            self._displayed_records.clear()
+            self.printer_status = '正在连接'
+            self.job_queue.put(('RESET', None))
+            self._wake_event.set()
+        self.logger.info(f'切换打印机: {new_printer}')

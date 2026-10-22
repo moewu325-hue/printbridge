@@ -3,21 +3,24 @@ import tkinter as tk
 from tkinter import ttk, messagebox
 
 from printer.controller import PrintController
+from gui.theme import COLORS, FONT, apply_theme
 
 
 class SettingsDialog(tk.Toplevel):
     """设置弹窗"""
 
-    def __init__(self, parent, config_mgr, monitor, logger):
+    def __init__(self, parent, config_mgr, monitor, logger, on_saved=None):
         super().__init__(parent)
         self.config_mgr = config_mgr
         self.monitor = monitor
         self.logger = logger
+        self.on_saved = on_saved
         self._data = dict(config_mgr.data)  # 编辑副本
 
         self.title("PrintBridge 设置")
-        self.geometry("520x520")
-        self.resizable(False, False)
+        self.geometry("600x590")
+        self.minsize(560, 540)
+        apply_theme(self)
         self.transient(parent)
         self.grab_set()
 
@@ -25,8 +28,12 @@ class SettingsDialog(tk.Toplevel):
         self.wait_window()
 
     def _build_ui(self):
+        heading = ttk.Frame(self, padding=(20, 16, 20, 8))
+        heading.pack(fill=tk.X)
+        ttk.Label(heading, text="设置", style="Title.TLabel").pack(anchor=tk.W)
+        ttk.Label(heading, text="管理打印设备、微信授权与通知方式", style="Muted.TLabel").pack(anchor=tk.W, pady=(4, 0))
         notebook = ttk.Notebook(self)
-        notebook.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
+        notebook.pack(fill=tk.BOTH, expand=True, padx=20, pady=(4, 0))
 
         # 标签页
         tab_printer = ttk.Frame(notebook)
@@ -34,7 +41,7 @@ class SettingsDialog(tk.Toplevel):
         tab_notify = ttk.Frame(notebook)
         notebook.add(tab_printer, text="打印机")
         notebook.add(tab_wechat, text="微信")
-        notebook.add(tab_notify, text="通知")
+        notebook.add(tab_notify, text="通知与文件")
 
         self._build_printer_tab(tab_printer)
         self._build_wechat_tab(tab_wechat)
@@ -42,38 +49,41 @@ class SettingsDialog(tk.Toplevel):
 
         # 底部按钮
         btn_frame = ttk.Frame(self)
-        btn_frame.pack(fill=tk.X, padx=10, pady=10)
-        ttk.Button(btn_frame, text="保存", command=self._on_save).pack(side=tk.RIGHT, padx=5)
-        ttk.Button(btn_frame, text="取消", command=self.destroy).pack(side=tk.RIGHT, padx=5)
+        btn_frame.pack(fill=tk.X, padx=20, pady=16)
+        ttk.Button(btn_frame, text="保存设置", style="Primary.TButton", command=self._on_save).pack(side=tk.RIGHT)
+        ttk.Button(btn_frame, text="取消", command=self.destroy).pack(side=tk.RIGHT, padx=8)
+        self.bind('<Escape>', lambda event: self.destroy())
 
     # ======================== 打印机标签页 ========================
 
     def _build_printer_tab(self, parent):
-        frame = ttk.LabelFrame(parent, text="打印机选择", padding=10)
-        frame.pack(fill=tk.X, padx=5, pady=5)
+        frame = ttk.LabelFrame(parent, text="打印设备", padding=14)
+        frame.pack(fill=tk.X, padx=4, pady=14)
 
         printers = PrintController.get_all_printers()
         printer_names = [p["name"] for p in printers]
         current = self._data.get("selected_printer", "")
 
-        ttk.Label(frame, text="默认打印机:").pack(anchor=tk.W)
+        ttk.Label(frame, text="当前设备", style="Muted.TLabel").pack(anchor=tk.W)
         self._printer_var = tk.StringVar(value=current)
         combo = ttk.Combobox(frame, textvariable=self._printer_var, values=printer_names, state="readonly")
         combo.pack(fill=tk.X, pady=5)
+        ttk.Label(frame, text="未指定时使用系统默认打印机；更换设备后会刷新队列。", style="Muted.TLabel").pack(anchor=tk.W, pady=(0, 12))
 
         # 轮询间隔
         int_frame = ttk.Frame(frame)
         int_frame.pack(fill=tk.X, pady=5)
-        ttk.Label(int_frame, text="轮询间隔(秒):").pack(side=tk.LEFT)
+        ttk.Label(int_frame, text="队列刷新间隔").pack(side=tk.LEFT)
         self._poll_var = tk.StringVar(value=str(self._data.get("poll_interval_sec", 2)))
         ttk.Spinbox(int_frame, from_=1, to=10, textvariable=self._poll_var, width=5).pack(side=tk.LEFT, padx=5)
+        ttk.Label(int_frame, text="秒（1–10）", style="Muted.TLabel").pack(side=tk.LEFT)
 
         # 最小化到托盘
         self._tray_var = tk.BooleanVar(value=self._data.get("min_to_tray", True))
         ttk.Checkbutton(frame, text="关闭窗口时最小化到系统托盘", variable=self._tray_var).pack(anchor=tk.W, pady=5)
 
         # 按钮
-        ttk.Button(frame, text="刷新打印机列表", command=lambda: self._refresh_printers(combo)).pack(pady=5)
+        ttk.Button(frame, text="刷新打印机列表", command=lambda: self._refresh_printers(combo)).pack(anchor=tk.W, pady=(12, 0))
 
     def _refresh_printers(self, combo):
         printers = PrintController.get_all_printers()
@@ -83,16 +93,20 @@ class SettingsDialog(tk.Toplevel):
 
     def _build_wechat_tab(self, parent):
         # 启用开关
-        toggle_frame = ttk.Frame(parent, padding=10)
-        toggle_frame.pack(fill=tk.X, padx=5, pady=5)
-        self._wechat_var = tk.BooleanVar(value=self._data.get("wechat_enabled", True))
-        ttk.Checkbutton(toggle_frame, text="启用微信桥接功能", variable=self._wechat_var).pack(anchor=tk.W)
+        toggle_frame = ttk.Frame(parent, padding=(4, 12, 4, 0))
+        toggle_frame.pack(fill=tk.X)
+        self._wechat_var = tk.BooleanVar(value=self._data.get("wechat_enabled", False))
+        ttk.Checkbutton(toggle_frame, text="启用微信命令与通知", variable=self._wechat_var).pack(anchor=tk.W)
+        ttk.Label(toggle_frame, text="需登录桌面微信，仅处理下方明确授权的会话。", style="Muted.TLabel").pack(anchor=tk.W, pady=(4, 0))
 
         # 监听目标
-        listen_frame = ttk.LabelFrame(parent, text="监听目标 (谁的消息会被处理)", padding=10)
-        listen_frame.pack(fill=tk.X, padx=5, pady=5)
+        listen_frame = ttk.LabelFrame(parent, text="授权会话", padding=10)
+        listen_frame.pack(fill=tk.X, padx=4, pady=10)
 
-        self._listen_listbox = tk.Listbox(listen_frame, height=4)
+        self._listen_listbox = tk.Listbox(listen_frame, height=3, font=(FONT, 9),
+                                        bg=COLORS['surface'], fg=COLORS['text'],
+                                        highlightbackground=COLORS['border'], relief='flat',
+                                        selectbackground=COLORS['selection'], selectforeground=COLORS['text'])
         self._listen_listbox.pack(fill=tk.X, pady=5)
         for target in self._data.get("wechat_listen_targets", ["文件传输助手"]):
             self._listen_listbox.insert(tk.END, target)
@@ -104,14 +118,17 @@ class SettingsDialog(tk.Toplevel):
 
         # 通知目标
         notify_frame = ttk.LabelFrame(parent, text="通知发送目标", padding=10)
-        notify_frame.pack(fill=tk.X, padx=5, pady=5)
+        notify_frame.pack(fill=tk.X, padx=4, pady=(0, 10))
         self._notify_target_var = tk.StringVar(value=self._data.get("wechat_notify_target", "文件传输助手"))
         ttk.Entry(notify_frame, textvariable=self._notify_target_var).pack(fill=tk.X, pady=5)
-        ttk.Label(notify_frame, text='建议使用"文件传输助手"(仅自己可见)').pack(anchor=tk.W)
+        ttk.Label(notify_frame, text="建议使用文件传输助手，避免发送到其他会话。", style="Muted.TLabel").pack(anchor=tk.W)
 
         # 自动打印
-        self._auto_print_var = tk.BooleanVar(value=self._data.get("auto_print_wechat_files", True))
-        ttk.Checkbutton(parent, text="自动打印微信收到的文件", variable=self._auto_print_var).pack(anchor=tk.W, padx=15, pady=5)
+        self._auto_print_var = tk.BooleanVar(value=self._data.get("auto_print_wechat_files", False))
+        self._auto_print_check = ttk.Checkbutton(parent, text="自动接收并打印微信附件（暂不可用）", variable=self._auto_print_var)
+        self._auto_print_check.pack(anchor=tk.W, padx=8)
+        self._auto_print_check.state(['disabled'])
+        ttk.Label(parent, text="附件收件流程尚未开放；保留已有配置，不自动接收附件。", style="Muted.TLabel").pack(anchor=tk.W, padx=8, pady=(4, 0))
 
     def _add_listen_target(self):
         dialog = tk.Toplevel(self)
@@ -143,7 +160,7 @@ class SettingsDialog(tk.Toplevel):
 
     def _build_notify_tab(self, parent):
         frame = ttk.LabelFrame(parent, text="微信通知触发条件", padding=10)
-        frame.pack(fill=tk.X, padx=5, pady=5)
+        frame.pack(fill=tk.X, padx=4, pady=14)
 
         self._notify_complete_var = tk.BooleanVar(value=self._data.get("notify_on_complete", True))
         self._notify_failure_var = tk.BooleanVar(value=self._data.get("notify_on_failure", True))
@@ -154,32 +171,43 @@ class SettingsDialog(tk.Toplevel):
         ttk.Checkbutton(frame, text="打印机异常时通知(缺纸/脱机)", variable=self._notify_error_var).pack(anchor=tk.W, pady=3)
 
         # 文件类型白名单
-        type_frame = ttk.LabelFrame(parent, text="允许自动打印的文件类型", padding=10)
-        type_frame.pack(fill=tk.X, padx=5, pady=5)
+        type_frame = ttk.LabelFrame(parent, text="打印文件扩展名白名单", padding=10)
+        type_frame.pack(fill=tk.X, padx=4, pady=(0, 8))
 
-        types = ["pdf", "doc/docx", "xls/xlsx", "ppt/pptx", "txt/csv", "png/jpg/jpeg"]
-        self._type_vars = {}
         allowed = self._data.get("allowed_file_types", [])
-        for i, ft in enumerate(types):
-            key = ft.split("/")[0]
-            var = tk.BooleanVar(value=key in allowed)
-            self._type_vars[key] = var
-            ttk.Checkbutton(type_frame, text=f".{ft}", variable=var).grid(
-                row=i // 3, column=i % 3, sticky=tk.W, padx=10, pady=2
+        types = list(dict.fromkeys([
+            "pdf", "doc", "docx", "xls", "xlsx", "ppt", "pptx", "txt", "csv",
+            "png", "jpg", "jpeg", *allowed,
+        ]))
+        self._type_vars = {}
+        for i, extension in enumerate(types):
+            var = tk.BooleanVar(value=extension in allowed)
+            self._type_vars[extension] = var
+            ttk.Checkbutton(type_frame, text=f".{extension}", variable=var).grid(
+                row=i // 4, column=i % 4, sticky=tk.W, padx=10, pady=2
             )
+        ttk.Label(parent, text="每种扩展名单独授权；取消勾选会移除该类型权限。", style="Muted.TLabel").pack(anchor=tk.W, padx=8)
 
     # ======================== 保存 ========================
 
     def _on_save(self):
         # 收集允许的文件类型
-        allowed_types = [k for k, v in self._type_vars.items() if v.get()]
+        try:
+            interval = int(self._poll_var.get())
+            if not 1 <= interval <= 10:
+                raise ValueError
+        except ValueError:
+            messagebox.showerror("设置无效", "轮询间隔请输入1至10之间的整数。", parent=self)
+            return
+        allowed_types = [extension for extension, var in self._type_vars.items()
+                         if var.get()]
 
         # 收集监听目标
         listen_targets = list(self._listen_listbox.get(0, tk.END))
 
         updates = {
             "selected_printer": self._printer_var.get(),
-            "poll_interval_sec": int(self._poll_var.get()),
+            "poll_interval_sec": interval,
             "min_to_tray": self._tray_var.get(),
             "wechat_enabled": self._wechat_var.get(),
             "wechat_listen_targets": listen_targets,
@@ -191,12 +219,20 @@ class SettingsDialog(tk.Toplevel):
             "allowed_file_types": allowed_types,
         }
 
-        self.config_mgr.update(updates)
+        try:
+            self.config_mgr.update(updates)
+        except Exception as exc:
+            messagebox.showerror("保存失败", str(exc), parent=self)
+            return
 
-        # 通知monitor切换打印机
-        new_printer = self._printer_var.get()
-        if new_printer != self.monitor.printer_name:
-            self.monitor.switch_printer(new_printer)
+        if self.on_saved:
+            self.on_saved()
+        else:
+            new_printer = self._printer_var.get()
+            if new_printer != self.monitor.printer_name:
+                self.monitor.switch_printer(new_printer)
+            self.monitor.poll_interval = interval
+            self.monitor.request_refresh()
 
         self.logger.info("设置已保存")
         messagebox.showinfo("设置", "设置已保存", parent=self)

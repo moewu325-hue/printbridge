@@ -4,6 +4,8 @@ import os
 import socket
 import sys
 import queue
+import threading
+from logging.handlers import RotatingFileHandler
 from pathlib import Path
 
 
@@ -21,15 +23,16 @@ def setup_logger(name: str = "PrintBridge", log_file: str = None) -> logging.Log
     )
 
     # 控制台
-    ch = logging.StreamHandler(sys.stdout)
-    ch.setLevel(logging.INFO)
-    ch.setFormatter(fmt)
-    logger.addHandler(ch)
+    if sys.stdout is not None:
+        ch = logging.StreamHandler(sys.stdout)
+        ch.setLevel(logging.INFO)
+        ch.setFormatter(fmt)
+        logger.addHandler(ch)
 
     # 文件
     if log_file:
         os.makedirs(os.path.dirname(log_file), exist_ok=True)
-        fh = logging.FileHandler(log_file, encoding="utf-8")
+        fh = RotatingFileHandler(log_file, maxBytes=2 * 1024 * 1024, backupCount=3, encoding="utf-8")
         fh.setLevel(logging.DEBUG)
         fh.setFormatter(fmt)
         logger.addHandler(fh)
@@ -100,14 +103,32 @@ def human_readable_size(size_bytes: int) -> str:
     return f"{size_bytes:.1f} TB"
 
 
+_instance_socket = None
+_instance_lock = threading.Lock()
+
+
 def singleton_lock(port: int = 21345) -> bool:
     """通过端口绑定实现单实例锁, 返回True表示首次启动"""
-    try:
+    global _instance_socket
+    with _instance_lock:
+        if _instance_socket is not None:
+            return False
         sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        sock.bind(("127.0.0.1", port))
-        sock.listen(1)
-        # 不关闭, 进程结束时自动释放
+        try:
+            if hasattr(socket, 'SO_EXCLUSIVEADDRUSE'):
+                sock.setsockopt(socket.SOL_SOCKET, socket.SO_EXCLUSIVEADDRUSE, 1)
+            sock.bind(('127.0.0.1', port))
+            sock.listen(1)
+        except OSError:
+            sock.close()
+            return False
+        _instance_socket = sock
         return True
-    except OSError:
-        return False
+
+
+def release_singleton_lock():
+    global _instance_socket
+    with _instance_lock:
+        if _instance_socket is not None:
+            _instance_socket.close()
+            _instance_socket = None

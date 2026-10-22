@@ -1,6 +1,7 @@
-# PrintBridge 依赖
-# 微信桥接通过 uiautomation 直接实现, 无需 wxauto
-uiautomation>=2.0.0
-pystray>=0.19.0
-Pillow>=10.0.0
-pywin32>=306
+# Windows/Python 3.11 x64，发行时验证的运行依赖
+uiautomation==2.0.29
+comtypes==1.4.16
+pystray==0.19.5
+six==1.17.0
+Pillow==12.3.0
+pywin32==312

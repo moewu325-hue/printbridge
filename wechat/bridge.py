@@ -1,22 +1,34 @@
-"""微信桥接核心: 基于uiautomation操控微信PC客户端"""
-import time
-import threading
+"""微信桥接：单一UI线程、历史基线和有界发送队列。"""
+import importlib
 import os
-import shutil
+import queue
+import threading
+import time
+from dataclasses import dataclass, field
 from typing import Optional
 
-import uiautomation as auto
+WECHAT_CLASS = 'WeChatMainWndForPC'
+WECHAT_PROCESS = 'WeChat.exe'
 
 
-# 微信窗口类名
-WECHAT_CLASS = "WeChatMainWndForPC"
-# 微信进程名
-WECHAT_PROCESS = "WeChat.exe"
+class DeliveryUnknown(RuntimeError):
+    """已进入发送阶段，无法确认结果，禁止自动重试。"""
+
+
+@dataclass
+class _SendRequest:
+    target: str
+    text: str
+    deadline: float
+    done: threading.Event = field(default_factory=threading.Event)
+    cancelled: threading.Event = field(default_factory=threading.Event)
+    result: bool = False
+    state: str = 'pending'
+    error: Optional[Exception] = None
+    lock: threading.Lock = field(default_factory=threading.Lock)
 
 
 class WeChatBridge:
-    """微信桥接: 监听消息 + 发送消息 + 文件下载"""
-
     def __init__(self, config_mgr, command_queue, file_queue, status_queue, logger):
         self.config_mgr = config_mgr
         self.command_queue = command_queue
@@ -25,236 +37,261 @@ class WeChatBridge:
         self.logger = logger
         self.running = False
         self.available = False
-        self._wx_window: Optional[auto.WindowControl] = None
-        self._thread: Optional[threading.Thread] = None
-        self._last_msg_count = 0  # 跟踪上次消息数量, 检测新消息
+        self._wx_window = None
+        self._thread = None
+        self._stop = threading.Event()
+        self._lifecycle_lock = threading.RLock()
+        self._outgoing = queue.Queue(maxsize=64)
+        self._snapshots = {}
+        self._auto = None
 
     @property
-    def is_available(self) -> bool:
-        return self.available
+    def is_available(self):
+        return self.available and self.running and not self._stop.is_set()
+
+    def _enabled(self):
+        return bool(self.config_mgr.get('wechat_enabled', False))
+
+    def _authorized(self, target):
+        return self._enabled() and target in self.config_mgr.get('wechat_listen_targets', [])
 
     def start(self):
-        """启动微信监听线程"""
-        self.running = True
-        self._thread = threading.Thread(
-            target=self._run_loop, name="WeChatBridge", daemon=True
-        )
-        self._thread.start()
-        self.logger.info("微信桥接线程已启动")
+        with self._lifecycle_lock:
+            if self._thread and self._thread.is_alive():
+                return
+            if not self._enabled():
+                return
+            self._stop = threading.Event()
+            self._snapshots.clear()
+            self.running = True
+            self._thread = threading.Thread(target=self._run_loop, name='WeChatBridge', daemon=True)
+            self._thread.start()
 
     def stop(self):
-        """停止监听"""
-        self.running = False
-        if self._thread and self._thread.is_alive():
-            self._thread.join(timeout=5)
-        self.logger.info("微信桥接已停止")
-
-    def _find_wechat(self) -> bool:
-        """查找微信主窗口"""
-        try:
-            self._wx_window = auto.WindowControl(
-                Name='微信', ClassName=WECHAT_CLASS
-            )
-            if self._wx_window.Exists(1, 1):
-                self.available = True
-                return True
-        except Exception:
-            pass
+        with self._lifecycle_lock:
+            self.running = False
+            self._stop.set()
+            thread = self._thread
+        if thread and thread is not threading.current_thread():
+            thread.join(timeout=5)
+        self._reject_pending()
         self.available = False
+        return not thread or not thread.is_alive()
+
+    def _reject_pending(self):
+        while True:
+            try:
+                request = self._outgoing.get_nowait()
+            except queue.Empty:
+                return
+            request.cancelled.set()
+            with request.lock:
+                request.state = 'done'
+            request.done.set()
+
+    def _set_available(self, value):
+        previous = self.available
+        self.available = value
+        if previous != value:
+            self.status_queue.put(('wechat', '已连接' if value else '未连接'))
+        if not value:
+            self._snapshots.clear()
+
+    def _find_wechat(self):
+        try:
+            window = self._auto.WindowControl(Name='微信', ClassName=WECHAT_CLASS)
+            if window.Exists(0, 0):
+                self._wx_window = window
+                self._set_available(True)
+                return True
+        except Exception as exc:
+            self.logger.debug('查找微信失败: %s', exc)
         self._wx_window = None
+        self._set_available(False)
         return False
 
     def _run_loop(self):
-        """主循环: 定期检测微信状态 + 读取消息"""
-        reconnect_delay = 10  # 重连间隔(秒)
-
-        while self.running:
-            if not self._find_wechat():
-                # 微信未运行或窗口找不到
-                if self.available:
-                    self.status_queue.put(("wechat", "未连接"))
-                    self.available = False
-                time.sleep(reconnect_delay)
-                continue
-
-            # 微信已找到
-            if not self.available:
-                self.available = True
-                self.status_queue.put(("wechat", "已连接"))
-                self.logger.info("微信已连接")
-
-            # 检查是否有新消息
-            try:
-                self._check_new_messages()
-            except Exception as e:
-                self.logger.debug(f"检查消息异常: {e}")
-                self.available = False
-
-            time.sleep(2)
-
-    def _check_new_messages(self):
-        """检查当前聊天窗口的新消息"""
-        if not self._wx_window:
-            return
-
-        # 获取当前会话的聊天列表
         try:
-            # 会话列表在微信窗口左侧
-            session_list = self._wx_window.ListControl(Name='会话')
-            if not session_list.Exists(0, 0):
-                return
+            self._auto = importlib.import_module('uiautomation')
+            with self._auto.UIAutomationInitializerInThread():
+                next_poll = 0
+                while not self._stop.is_set() and self._enabled():
+                    now = time.monotonic()
+                    if now >= next_poll:
+                        connected = self._find_wechat()
+                        if connected:
+                            self._check_new_messages()
+                        next_poll = time.monotonic() + (2 if connected else 10)
+                    try:
+                        request = self._outgoing.get(timeout=0.1)
+                    except queue.Empty:
+                        continue
+                    try:
+                        if not request.cancelled.is_set() and time.monotonic() < request.deadline:
+                            request.result = self._send_now(request.target, request.text, request)
+                    except DeliveryUnknown as exc:
+                        request.error = exc
+                    except Exception as exc:
+                        self.logger.warning('微信发送异常: %s', exc)
+                    finally:
+                        with request.lock:
+                            if request.state != 'unknown':
+                                request.state = 'done'
+                        request.done.set()
+        except Exception as exc:
+            self.logger.error('微信UI工作线程失败: %s', exc)
+        finally:
+            self.running = False
+            self._wx_window = None
+            self._set_available(False)
+            self._reject_pending()
 
-            # 获取列表项
-            items = session_list.GetChildren()
-            if not items:
-                return
+    def _verify_chat(self, target):
+        # 目标标题、消息区和输入框均需存在；客户端结构变化时拒绝发送。
+        header = self._wx_window.TextControl(Name=target, searchDepth=2)
+        messages = self._wx_window.ListControl(Name='消息')
+        input_edit = self._wx_window.EditControl(Name='输入')
+        return header.Exists(0, 0) and messages.Exists(0, 0) and input_edit.Exists(0, 0)
 
-            # 遍历监听的会话 (简化版: 通过搜索和选择目标聊天)
-            targets = self.config_mgr.get("wechat_listen_targets", ["文件传输助手"])
-            for target in targets:
-                self._check_chat_messages(target)
+    def _open_chat(self, target):
+        if not self._wx_window or self._stop.is_set():
+            return False
+        search = self._wx_window.EditControl(Name='搜索')
+        if not search.Exists(0, 0):
+            return False
+        if not self._set_text(search, target):
+            return False
+        if self._stop.wait(0.3):
+            return False
+        # 精确匹配且仅有一个结果，重名联系人不猜测。
+        first = self._wx_window.ListItemControl(Name=target, foundIndex=1)
+        second = self._wx_window.ListItemControl(Name=target, foundIndex=2)
+        if not first.Exists(0, 0) or second.Exists(0, 0):
+            return False
+        first.Click()
+        if self._stop.wait(0.2):
+            return False
+        return self._verify_chat(target)
 
-        except Exception as e:
-            self.logger.debug(f"消息检查失败: {e}")
-
-    def _check_chat_messages(self, chat_name: str):
-        """检查指定聊天的未读消息"""
+    @staticmethod
+    def _set_text(edit, text):
         try:
-            # 搜索并点击目标聊天
-            search_edit = self._wx_window.EditControl(Name='搜索')
-            if not search_edit.Exists(0, 0):
-                return
-
-            # 点击搜索框, 输入聊天名称
-            search_edit.Click()
-            auto.SendKeys('{Ctrl}a{Delete}')
-            auto.SendKeys(chat_name)
-            time.sleep(0.3)
-
-            # 选择第一个搜索结果
-            result = self._wx_window.ListItemControl(Name=chat_name)
-            if result.Exists(0, 0.5):
-                result.Click()
-                time.sleep(0.2)
-
-                # 读取最新消息
-                self._read_latest_message(chat_name)
-        except Exception as e:
-            self.logger.debug(f"聊天 {chat_name} 检查异常: {e}")
-
-    def _read_latest_message(self, chat_name: str):
-        """读取当前聊天窗口的最新消息"""
-        try:
-            # 消息列表区域
-            msg_list = self._wx_window.ListControl(Name='消息')
-            if not msg_list.Exists(0, 0):
-                return
-
-            msgs = msg_list.GetChildren()
-            if not msgs:
-                return
-
-            # 检查是否有新消息 (比较数量)
-            current_count = len(msgs)
-            if current_count > self._last_msg_count:
-                # 有新消息, 读取最后一条
-                last_msg = msgs[-1]
-                msg_text = last_msg.Name or ""
-
-                self.logger.info(f"[微信] {chat_name}: {msg_text[:50]}")
-
-                # 判断是否为命令
-                if msg_text.startswith("/"):
-                    self.command_queue.put((chat_name, msg_text))
-
-                self._last_msg_count = current_count
-
-        except Exception as e:
-            self.logger.debug(f"读取消息异常: {e}")
-
-    # ======================== 发送消息 ========================
-
-    def send_message(self, target: str, text: str) -> bool:
-        """向指定联系人/群发送消息"""
-        if not self.available or not self._wx_window:
+            pattern = edit.GetValuePattern()
+            return pattern.SetValue(text) is True and pattern.Value == text
+        except Exception:
             return False
 
+    def _check_new_messages(self):
+        targets = self.config_mgr.get('wechat_listen_targets', []) if self._enabled() else []
+        self._snapshots = {name: snapshot for name, snapshot in self._snapshots.items() if name in targets}
+        for target in targets:
+            if self._stop.is_set():
+                break
+            self._check_chat_messages(target)
+
+    def _check_chat_messages(self, chat_name):
+        if not self._authorized(chat_name):
+            return
         try:
-            # 搜索目标
-            search_edit = self._wx_window.EditControl(Name='搜索')
-            if not search_edit.Exists(0, 0):
-                return False
+            if self._open_chat(chat_name):
+                self._read_latest_message(chat_name)
+            else:
+                self._snapshots.pop(chat_name, None)
+        except Exception as exc:
+            self._snapshots.pop(chat_name, None)
+            self.logger.debug('微信聊天读取失败: %s', exc)
 
-            search_edit.Click()
-            auto.SendKeys('{Ctrl}a{Delete}')
-            auto.SendKeys(target)
-            time.sleep(0.3)
+    @staticmethod
+    def _message_id(message):
+        try:
+            value = tuple(message.GetRuntimeId())
+            return value if value else None
+        except Exception:
+            return None
 
-            result = self._wx_window.ListItemControl(Name=target)
-            if result.Exists(0, 0.5):
-                result.Click()
-                time.sleep(0.2)
+    def _read_latest_message(self, chat_name):
+        control = self._wx_window.ListControl(Name='消息')
+        if not control.Exists(0, 0):
+            return
+        messages = control.GetChildren()
+        ids = [self._message_id(message) for message in messages]
+        previous = self._snapshots.get(chat_name)
+        # 无稳定身份、空视图或重复身份均只重建基线。
+        if not ids or None in ids or len(set(ids)) != len(ids):
+            self._snapshots.pop(chat_name, None)
+            return
+        self._snapshots[chat_name] = ids
+        if not previous or previous[-1] not in ids:
+            return
+        anchor = ids.index(previous[-1])
+        # 视图重排或身份重用时不推断新命令。
+        overlap = [item for item in ids[:anchor + 1] if item in previous]
+        if overlap != [item for item in previous if item in ids]:
+            return
+        for message, identity in zip(messages[anchor + 1:], ids[anchor + 1:]):
+            if identity in previous or not self._authorized(chat_name):
+                continue
+            text = message.Name or ''
+            if text.startswith('/'):
+                self.command_queue.put((chat_name, text))
 
-                # 找到输入框并发送
-                input_edit = self._wx_window.EditControl(Name='输入')
-                if not input_edit.Exists(0, 0):
-                    # 尝试通过类名找
-                    input_edit = self._wx_window.EditControl()
-                if input_edit.Exists(0, 0):
-                    input_edit.Click()
-                    auto.SendKeys(text)
-                    auto.SendKeys('{Enter}')
-                    self.logger.info(f"[微信] 发送 → {target}: {text[:50]}")
-                    return True
+    def send_message(self, target, text):
+        if not self.is_available or not self._enabled():
+            return False
+        # 通知目标可独立设置；命令回复只能发往仍授权的会话。
+        notify_target = self.config_mgr.get('wechat_notify_target', '')
+        if target != notify_target and not self._authorized(target):
+            return False
+        if threading.current_thread() is self._thread:
+            return self._send_now(target, text)
+        request = _SendRequest(target, text, time.monotonic() + 8)
+        try:
+            self._outgoing.put_nowait(request)
+        except queue.Full:
+            return False
+        if not request.done.wait(timeout=8):
+            with request.lock:
+                if request.state in ('sending', 'unknown'):
+                    request.state = 'unknown'
+                    raise DeliveryUnknown('发送已开始，等待超时；结果未知且不自动重试')
+                if request.state == 'pending':
+                    request.cancelled.set()
+                    return False
+        if request.error:
+            raise request.error
+        return request.result
 
-        except Exception as e:
-            self.logger.error(f"发送消息失败: {e}")
+    def _send_now(self, target, text, request=None):
+        if not self.is_available or not self._enabled():
+            return False
+        allowed = target == self.config_mgr.get('wechat_notify_target', '') or self._authorized(target)
+        if not allowed or not self._open_chat(target):
+            return False
+        if request and (request.cancelled.is_set() or time.monotonic() >= request.deadline):
+            return False
+        edit = self._wx_window.EditControl(Name='输入')
+        if not self._set_text(edit, text):
+            return False
+        allowed = target == self.config_mgr.get('wechat_notify_target', '') or self._authorized(target)
+        if self._stop.is_set() or not self._enabled() or not allowed or not self._verify_chat(target):
+            return False
+        if request:
+            with request.lock:
+                if request.cancelled.is_set() or time.monotonic() >= request.deadline or self._stop.is_set():
+                    return False
+                request.state = 'sending'
+        try:
+            edit.SendKeys('{Enter}')
+        except Exception as exc:
+            if isinstance(exc, DeliveryUnknown):
+                raise
+            raise DeliveryUnknown('发送已开始后发生异常；结果未知且不自动重试') from exc
+        return True
 
-        return False
-
-    # ======================== 文件操作 ========================
-
-    def receive_file(self, chat_name: str, save_dir: str) -> Optional[str]:
-        """尝试下载当前聊天窗口的最新文件 (实验性)"""
-        # uiautomation 无法直接通过API下载微信文件
-        # 此方法作为扩展接口预留
-        # 微信文件通常保存在: Documents\WeChat Files\wxid_xxx\FileStorage\
-        self.logger.debug(f"文件接收功能需微信客户端手动下载, 暂不支持自动下载")
+    def receive_file(self, chat_name, save_dir) -> Optional[str]:
+        self.logger.debug('未建立消息与下载文件关联，自动收件不可用')
         return None
 
     def find_latest_received_file(self) -> Optional[str]:
-        """查找微信最近接收的文件"""
-        # 微信默认文件存储路径
-        wechat_files = os.path.join(
-            os.environ.get("USERPROFILE", "C:\\Users\\wsn"),
-            "Documents", "WeChat Files"
-        )
-        if not os.path.exists(wechat_files):
-            return None
-
-        latest = None
-        latest_time = 0
-
-        # 遍历所有微信账号目录
-        for account_dir in os.listdir(wechat_files):
-            if not account_dir.startswith("wxid_"):
-                continue
-            file_storage = os.path.join(wechat_files, account_dir, "FileStorage", "File")
-            if not os.path.exists(file_storage):
-                continue
-            # 按月组织的目录
-            for month_dir in os.listdir(file_storage):
-                month_path = os.path.join(file_storage, month_dir)
-                if not os.path.isdir(month_path):
-                    continue
-                for fname in os.listdir(month_path):
-                    fpath = os.path.join(month_path, fname)
-                    try:
-                        mtime = os.path.getmtime(fpath)
-                        if mtime > latest_time:
-                            latest_time = mtime
-                            latest = fpath
-                    except OSError:
-                        continue
-
-        return latest
+        # 不扫描其他账号或猜测最新文件的消息来源。
+        return None

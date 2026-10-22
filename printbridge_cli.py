@@ -1,291 +1,235 @@
-"""PrintBridge CLI — 供 Claude Code / wechat-claude-code 调用的命令行接口
-
-用法:
-  python printbridge_cli.py --status          # 查看打印机状态
-  python printbridge_cli.py --list            # 列出队列中的作业
-  python printbridge_cli.py --print <文件名>   # 搜索并打印文件
-  python printbridge_cli.py --print <完整路径> # 打印指定路径的文件
-  python printbridge_cli.py --cancel <作业ID>  # 取消作业
-  python printbridge_cli.py --cancel all      # 清空队列
-  python printbridge_cli.py --search <关键词>  # 搜索微信接收的文件
-"""
+"""PrintBridge命令行：明确文件、打印机和可解析结果。"""
 import argparse
+import json
 import os
 import sys
-import glob
 import time
+from pathlib import Path
 
 
-def main():
-    parser = argparse.ArgumentParser(description="PrintBridge CLI")
-    parser.add_argument("--status", action="store_true", help="查看打印机状态")
-    parser.add_argument("--list", action="store_true", help="列出队列中的作业")
-    parser.add_argument("--print", type=str, metavar="FILE", help="打印文件(文件名或路径)")
-    parser.add_argument("--search", type=str, metavar="KEYWORD", help="搜索微信接收的文件")
-    parser.add_argument("--cancel", type=str, metavar="JOB_ID", help="取消作业 (ID 或 'all')")
-    parser.add_argument("--json", action="store_true", help="JSON格式输出")
-
-    args = parser.parse_args()
-
-    if args.status:
-        cmd_status(args.json)
-    elif args.list:
-        cmd_list(args.json)
-    elif args.print:
-        cmd_print(args.print, args.json)
-    elif args.search:
-        cmd_search(args.search, args.json)
-    elif args.cancel:
-        cmd_cancel(args.cancel, args.json)
-    else:
-        parser.print_help()
+class AmbiguousFileError(ValueError):
+    def __init__(self, paths):
+        self.paths = paths
+        super().__init__('存在同名文件，请提供完整路径')
 
 
-# ======================== 文件搜索 ========================
+class _ArgumentParser(argparse.ArgumentParser):
+    def error(self, message):
+        raise ValueError(message)
+
+
+def _config():
+    from app_paths import config_path
+    from config import ConfigManager
+    return ConfigManager(str(config_path()), create=False)
+
+
+def _printer(explicit=None):
+    from app_paths import resolve_printer
+    name = resolve_printer(_config(), explicit)
+    if not name:
+        raise ValueError('未选择打印机且系统没有默认打印机')
+    return name
+
+
+def _controller():
+    from printer.controller import PrintController
+    return PrintController
+
 
 def find_wechat_file_storage() -> str:
-    """找到微信文件存储根目录"""
-    userprofile = os.environ.get("USERPROFILE", "C:\\Users\\wsn")
-    base = os.path.join(userprofile, "Documents", "WeChat Files")
-    if not os.path.exists(base):
-        return ""
-    # 遍历所有 wxid_ 账号目录
-    for account in os.listdir(base):
-        if not account.startswith("wxid_"):
-            continue
-        file_dir = os.path.join(base, account, "FileStorage", "File")
-        if os.path.exists(file_dir):
-            return file_dir
-    return ""
+    # 仅显式配置微信目录，避免猜测其他账号。
+    return os.environ.get('PRINTBRIDGE_WECHAT_FILES', '')
 
 
 def _get_search_dirs() -> list:
-    """获取需要搜索的目录列表(兼容桌面重定向到D盘)"""
-    dirs = []
-    for env_key in ("USERPROFILE", "HOMEDRIVE", "HOMEPATH"):
-        base = os.environ.get(env_key, "")
-        if base:
-            for sub in ("Desktop", "Downloads", "Documents"):
-                d = os.path.join(base, sub)
-                if os.path.isdir(d):
-                    dirs.append(d)
-    # 常见中文路径
-    for extra in (r"D:\桌面", r"D:\下载", r"D:\文档"):
-        if os.path.isdir(extra):
-            dirs.append(extra)
-    # 去重
-    return list(dict.fromkeys(dirs))
+    value = os.environ.get('PRINTBRIDGE_SEARCH_DIRS', '')
+    return [p for p in value.split(os.pathsep) if p]
+
+
+def _iter_files(max_depth=2):
+    roots = [find_wechat_file_storage(), *_get_search_dirs()]
+    seen_roots, seen_files = set(), set()
+    for raw in roots:
+        if not raw:
+            continue
+        base = Path(raw).resolve()
+        if base in seen_roots or not base.is_dir():
+            continue
+        seen_roots.add(base)
+        for current, dirs, files in os.walk(base, followlinks=False):
+            current_path = Path(current)
+            depth = len(current_path.relative_to(base).parts)
+            dirs[:] = sorted(d for d in dirs if not (current_path / d).is_symlink()) if depth < max_depth else []
+            for name in sorted(files):
+                path = current_path / name
+                try:
+                    if path.is_symlink() or not path.is_file():
+                        continue
+                    real = path.resolve()
+                    if not real.is_relative_to(base) or real in seen_files:
+                        continue
+                    seen_files.add(real)
+                    yield str(real)
+                except OSError:
+                    continue
 
 
 def search_files(keyword: str) -> list:
-    """在微信文件存储中搜索文件, 返回匹配的路径列表"""
+    if not keyword.strip():
+        raise ValueError('搜索关键词不能为空')
     results = []
-    storage = find_wechat_file_storage()
-    if not storage:
-        return results
-
-    keyword_lower = keyword.lower()
-    # 遍历 YYYY-MM 子目录
-    for month_dir in os.listdir(storage):
-        month_path = os.path.join(storage, month_dir)
-        if not os.path.isdir(month_path):
-            continue
-        for fname in os.listdir(month_path):
-            if keyword_lower in fname.lower():
-                fpath = os.path.join(month_path, fname)
-                results.append(fpath)
-
-    # 按修改时间倒序
-    results.sort(key=lambda p: os.path.getmtime(p), reverse=True)
-    return results
+    for path in _iter_files():
+        if keyword.casefold() in Path(path).name.casefold():
+            try:
+                results.append((os.path.getmtime(path), path))
+            except OSError:
+                continue
+    return [p for _, p in sorted(results, key=lambda item: (-item[0], item[1]))]
 
 
 def find_file(target: str) -> str:
-    """根据文件名或路径找文件, 返回完整路径或空"""
-    # 1. 精确路径
-    if os.path.isfile(target):
-        return os.path.abspath(target)
-
-    # 2. 在当前目录搜索
-    if os.path.isfile(os.path.join(os.getcwd(), target)):
-        return os.path.abspath(os.path.join(os.getcwd(), target))
-
-    # 3. 在微信文件存储中模糊搜索
-    storage = find_wechat_file_storage()
-    if storage:
-        target_lower = target.lower()
-        best_match = None
-        best_time = 0
-        for month_dir in os.listdir(storage):
-            month_path = os.path.join(storage, month_dir)
-            if not os.path.isdir(month_path):
-                continue
-            for fname in os.listdir(month_path):
-                fname_lower = fname.lower()
-                # 完全匹配文件名
-                if fname_lower == target_lower:
-                    return os.path.join(month_path, fname)
-                # 部分匹配 (关键词在文件名中)
-                if target_lower in fname_lower:
-                    fpath = os.path.join(month_path, fname)
-                    mtime = os.path.getmtime(fpath)
-                    if mtime > best_time:
-                        best_time = mtime
-                        best_match = fpath
-        if best_match:
-            return best_match
-
-    # 4. 全局搜索桌面和下载目录
-    search_dirs = _get_search_dirs()
-    for sdir in search_dirs:
-        if not os.path.exists(sdir):
-            continue
-        for root, dirs, files in os.walk(sdir):
-            depth = root.replace(sdir, "").count(os.sep)
-            if depth > 2:
-                continue
-            for fname in files:
-                if target.lower() in fname.lower():
-                    return os.path.join(root, fname)
-
-    return ""
+    if not target.strip():
+        return ''
+    path = Path(target).expanduser()
+    # 仅明确路径直达；裸文件名需检查当前目录与配置根的全部重名。
+    if path.is_absolute() or '/' in target or '\\' in target:
+        return str(path.resolve()) if path.is_file() else ''
+    matches = {p for p in _iter_files() if Path(p).name.casefold() == target.casefold()}
+    for candidate in Path.cwd().iterdir():
+        if candidate.name.casefold() == target.casefold() and candidate.is_file():
+            matches.add(str(candidate.resolve()))
+    matches = sorted(matches)
+    if len(matches) > 1:
+        raise AmbiguousFileError(matches)
+    return matches[0] if matches else ''
 
 
 def human_size(size: int) -> str:
-    for unit in ("B", "KB", "MB"):
-        if size < 1024:
-            return f"{size:.0f}{unit}"
-        size /= 1024
-    return f"{size:.0f}MB"
+    value = float(size)
+    for unit in ('B', 'KB', 'MB', 'GB', 'TB'):
+        if value < 1024 or unit == 'TB':
+            return f'{value:.0f}{unit}'
+        value /= 1024
 
 
-# ======================== 命令实现 ========================
-
-def cmd_status(json_output=False):
-    """查看打印机状态"""
+def _emit(command, json_output, action):
     try:
-        from printer.controller import PrintController
-        printers = PrintController.get_all_printers()
-        if not printers:
-            print("未检测到实体打印机")
-            return
-
-        for p in printers:
-            info = PrintController.get_printer_info(p["name"])
-            status_text = "就绪" if (info and info.get("status", 0) == 0) else "异常"
-            jobs = info.get("jobs_count", 0) if info else 0
-            print(f"🖨 {p['name']}")
-            print(f"   状态: {status_text} | 队列: {jobs} 个作业")
-    except Exception as e:
-        print(f"错误: {e}")
-
-
-def cmd_list(json_output=False):
-    """列出队列中的作业"""
-    try:
-        import win32print
-        from printer.monitor import decode_status
-        from printer.controller import PrintController
-
-        printers = PrintController.get_all_printers()
-        if not printers:
-            print("未检测到打印机")
-            return
-
-        for p in printers:
-            try:
-                h = win32print.OpenPrinter(p["name"])
-                jobs = win32print.EnumJobs(h, 0, 99, 2)
-                win32print.ClosePrinter(h)
-
-                print(f"🖨 {p['name']} ({len(jobs)} 个作业)")
-                for j in jobs:
-                    jid = j.get("JobId", 0)
-                    doc = j.get("pDocument", "?")
-                    status = decode_status(j.get("Status", 0))
-                    pages = j.get("TotalPages", 0) or 0
-                    print(f"   #{jid} [{status}] {doc} ({pages}页)")
-                if not jobs:
-                    print("   (空)")
-            except Exception as e:
-                print(f"  无法读取: {e}")
-    except Exception as e:
-        print(f"错误: {e}")
+        data = action()
+        result = {'ok': True, 'command': command, 'data': data, 'error': None}
+        code = 0
+    except Exception as exc:
+        error = {'message': str(exc), 'type': type(exc).__name__}
+        if isinstance(exc, AmbiguousFileError):
+            error['candidates'] = exc.paths
+        result = {'ok': False, 'command': command, 'data': None, 'error': error}
+        code = 1
+    if json_output:
+        print(json.dumps(result, ensure_ascii=False, default=str))
+    elif result['ok']:
+        print(json.dumps(result['data'], ensure_ascii=False, indent=2, default=str))
+    else:
+        print('错误: ' + result['error']['message'])
+        for path in result['error'].get('candidates', []):
+            print('  ' + path)
+    return code
 
 
-def cmd_print(target: str, json_output=False):
-    """搜索并打印文件"""
-    filepath = find_file(target)
-    if not filepath:
-        print(f"❌ 未找到文件: {target}")
-        print(f"   提示: 请确保文件已在微信中下载, 或提供完整路径")
-        sys.exit(1)
-
-    fname = os.path.basename(filepath)
-    fsize = human_size(os.path.getsize(filepath))
-    print(f"📄 找到: {fname} ({fsize})")
-
-    # 提交打印
-    try:
-        from printer.controller import PrintController
-        printers = PrintController.get_all_printers()
-        if not printers:
-            print("❌ 未检测到打印机")
-            sys.exit(1)
-
-        printer = printers[0]["name"]
-        ok = PrintController.print_file(filepath, printer)
-        if ok:
-            print(f"✅ 已提交打印: {fname} → {printer}")
+def cmd_status(json_output=False, printer=None):
+    def action():
+        controller = _controller()
+        if printer:
+            names = [printer]
         else:
-            print(f"❌ 提交打印失败")
-            sys.exit(1)
-    except Exception as e:
-        print(f"❌ 打印失败: {e}")
-        sys.exit(1)
+            names = [p['name'] for p in controller.get_all_printers(strict=True)]
+        result = []
+        for name in names:
+            info = controller.get_printer_info(name)
+            if info is None:
+                raise RuntimeError('无法读取打印机状态: ' + name)
+            result.append({'printer': name, 'info': info})
+        return result
+    return _emit('status', json_output, action)
+
+
+def cmd_list(json_output=False, printer=None):
+    def action():
+        name = _printer(printer)
+        return {'printer': name, 'jobs': _controller().get_jobs(name)}
+    return _emit('list', json_output, action)
+
+
+def cmd_print(target: str, json_output=False, printer=None):
+    def action():
+        filepath = find_file(target)
+        if not filepath:
+            raise FileNotFoundError('未找到唯一精确文件，请提供完整路径: ' + target)
+        from utils import is_printable_file
+        config = _config()
+        allowed = {'.' + str(ext).lower().lstrip('.') for ext in config.get('allowed_file_types', [])}
+        if not is_printable_file(filepath) or Path(filepath).suffix.lower() not in allowed:
+            raise ValueError('配置不允许打印此文件类型')
+        name = _printer(printer)
+        if not _controller().print_file(filepath, name):
+            raise RuntimeError('提交打印失败')
+        return {'file': filepath, 'printer': name, 'status': 'submitted', 'message': '已发起打印请求，实际完成状态请查看打印队列'}
+    return _emit('print', json_output, action)
 
 
 def cmd_search(keyword: str, json_output=False):
-    """搜索微信接收的文件"""
-    files = search_files(keyword)
-    if not files:
-        print(f"未找到包含 '{keyword}' 的文件")
-        return
-
-    print(f"找到 {len(files)} 个匹配文件:")
-    for f in files[:10]:  # 最多显示10个
-        fname = os.path.basename(f)
-        mtime = time.strftime("%Y-%m-%d %H:%M", time.localtime(os.path.getmtime(f)))
-        size = human_size(os.path.getsize(f))
-        print(f"  📄 {fname}")
-        print(f"     {size} | {mtime}")
-        print(f"     {f}")
-    if len(files) > 10:
-        print(f"  ... 还有 {len(files) - 10} 个结果")
+    def action():
+        items = []
+        for path in search_files(keyword):
+            try:
+                stat = os.stat(path)
+            except OSError:
+                continue
+            items.append({'path': path, 'size': stat.st_size, 'modified': time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(stat.st_mtime))})
+        return items
+    return _emit('search', json_output, action)
 
 
-def cmd_cancel(job_id: str, json_output=False):
-    """取消作业"""
+def cmd_cancel(job_id: str, json_output=False, printer=None):
+    def action():
+        if job_id.lower() != 'all' and (not job_id.isdecimal() or int(job_id) <= 0):
+            raise ValueError('作业ID必须为正整数或all')
+        name = _printer(printer)
+        controller = _controller()
+        ok = controller.purge_queue(name) if job_id.lower() == 'all' else controller.cancel_job(name, int(job_id))
+        if not ok:
+            raise RuntimeError('取消作业失败')
+        return {'printer': name, 'job_id': job_id, 'status': 'cancel_requested'}
+    return _emit('cancel', json_output, action)
+
+
+def main(argv=None):
+    argv = list(sys.argv[1:] if argv is None else argv)
+    parser = _ArgumentParser(description='PrintBridge CLI')
+    commands = parser.add_mutually_exclusive_group(required=True)
+    commands.add_argument('--status', action='store_true', help='查看打印机状态')
+    commands.add_argument('--list', action='store_true', help='列出所选打印机作业')
+    commands.add_argument('--print', metavar='FILE', help='完整路径或唯一精确文件名')
+    commands.add_argument('--search', metavar='KEYWORD', help='搜索显式配置目录')
+    commands.add_argument('--cancel', metavar='JOB_ID', help='取消作业ID或all')
+    parser.add_argument('--printer', help='明确指定打印机')
+    parser.add_argument('--json', action='store_true', help='输出单个JSON对象')
     try:
-        from printer.controller import PrintController
-        printers = PrintController.get_all_printers()
-        if not printers:
-            print("未检测到打印机")
-            return
-        printer = printers[0]["name"]
-
-        if job_id.lower() == "all":
-            ok = PrintController.purge_queue(printer)
-            print("✅ 打印队列已清空" if ok else "❌ 清空失败")
-        else:
-            jid = int(job_id)
-            ok = PrintController.cancel_job(printer, jid)
-            print(f"✅ 作业 #{jid} 已取消" if ok else f"❌ 取消失败")
-    except ValueError:
-        print(f"无效的作业ID: {job_id}")
-    except Exception as e:
-        print(f"❌ 错误: {e}")
+        args = parser.parse_args(argv)
+    except ValueError as exc:
+        def fail(message=str(exc)):
+            raise ValueError(message)
+        _emit('arguments', '--json' in argv, fail)
+        return 2
+    if args.status:
+        return cmd_status(args.json, args.printer)
+    if args.list:
+        return cmd_list(args.json, args.printer)
+    if args.print is not None:
+        return cmd_print(args.print, args.json, args.printer)
+    if args.search is not None:
+        return cmd_search(args.search, args.json)
+    return cmd_cancel(args.cancel, args.json, args.printer)
 
 
-if __name__ == "__main__":
-    main()
+if __name__ == '__main__':
+    raise SystemExit(main())

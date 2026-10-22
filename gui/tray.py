@@ -1,7 +1,6 @@
 """系统托盘: pystray集成, 最小化/还原/退出"""
-import threading
-import os
 from PIL import Image, ImageDraw
+import threading
 
 
 def _create_icon_image(size: int = 64) -> Image.Image:
@@ -34,34 +33,36 @@ def _create_icon_image(size: int = 64) -> Image.Image:
 class SystemTray:
     """系统托盘控制器"""
 
-    def __init__(self, main_window, config_mgr, shutdown_event, logger):
+    def __init__(self, main_window, config_mgr, shutdown_event, logger, on_toggle_panel=None):
         self.main_window = main_window
         self.config_mgr = config_mgr
         self.shutdown_event = shutdown_event
         self.logger = logger
-        self._tray_thread = None
+        self.on_toggle_panel = on_toggle_panel
         self._icon = None
+        self._thread = None
+        self._ready = threading.Event()
+        self._stopping = threading.Event()
 
-    def setup(self):
+    @property
+    def is_ready(self):
+        return (self._ready.is_set() and not self._stopping.is_set()
+                and self._thread is not None and self._thread.is_alive())
+
+    def setup(self) -> bool:
         """创建托盘图标并在独立线程中运行"""
+        if self._thread and self._thread.is_alive():
+            return self.is_ready
+        self._ready.clear()
+        self._stopping.clear()
         try:
             import pystray
 
-            icon_path = os.path.join(
-                os.path.dirname(os.path.dirname(__file__)), "resources", "icon.png"
-            )
-
-            # 如果没有图标文件, 用Pillow生成
-            if os.path.exists(icon_path):
-                image = Image.open(icon_path)
-            else:
-                image = _create_icon_image()
-                os.makedirs(os.path.dirname(icon_path), exist_ok=True)
-                image.save(icon_path)
+            image = _create_icon_image()
 
             menu = pystray.Menu(
                 pystray.MenuItem("显示主窗口", self._on_show),
-                pystray.MenuItem("暂停/恢复监听", self._on_toggle_listen, checked=lambda item: True),
+                pystray.MenuItem("显示/隐藏打印面板", self._on_toggle_panel),
                 pystray.Menu.SEPARATOR,
                 pystray.MenuItem("退出", self._on_exit),
             )
@@ -70,38 +71,63 @@ class SystemTray:
                 "printbridge", image, "PrintBridge — 打印队列管理", menu
             )
 
-            # 在独立线程运行
-            self._tray_thread = threading.Thread(
-                target=self._icon.run, name="TrayIcon", daemon=True
-            )
-            self._tray_thread.start()
-            self.logger.info("系统托盘已创建")
+            # Windows事件循环与其setup线程均继承daemon，失败不会阻止进程退出。
+            self._thread = threading.Thread(target=self._run_icon, name='TrayIcon', daemon=True)
+            self._thread.start()
+            return self.is_ready
 
         except ImportError:
             self.logger.warning("pystray未安装, 托盘功能不可用")
         except Exception as e:
             self.logger.error(f"托盘创建失败: {e}")
+        self.stop()
+        return False
+
+    def _run_icon(self):
+        try:
+            self._icon.run(setup=self._on_ready)
+        except Exception:
+            self.logger.exception('托盘事件循环创建失败')
+        finally:
+            self._ready.clear()
+
+    def _on_ready(self, icon):
+        try:
+            if self._stopping.is_set():
+                icon.stop()
+                return
+            icon.visible = True
+            if self._stopping.is_set():
+                icon.stop()
+                return
+            self._ready.set()
+            self.logger.info('系统托盘已就绪')
+        except Exception:
+            self._ready.clear()
+            self.logger.exception('托盘图标显示失败')
+            icon.stop()
 
     def _on_show(self, icon, item):
         """显示主窗口"""
-        self.main_window.root.after(0, self.main_window.show)
+        self.main_window.queues["status_queue"].put(("ui", "show"))
 
-    def _on_toggle_listen(self, icon, item):
-        """切换微信监听(预留)"""
-        pass
+    def _on_toggle_panel(self, icon, item):
+        """托盘线程只投递请求，实际切换在主线程完成。"""
+        self.main_window.queues["status_queue"].put(("ui", "toggle_panel"))
 
     def _on_exit(self, icon, item):
         """退出应用"""
         self.logger.info("用户通过托盘菜单退出")
         self.shutdown_event.set()
-        if self._icon:
-            self._icon.stop()
-        self.main_window.root.after(0, self.main_window.root.destroy)
 
     def stop(self):
         """停止托盘"""
+        self._stopping.set()
+        self._ready.clear()
         if self._icon:
             try:
                 self._icon.stop()
             except Exception:
                 pass
+        if self._thread and self._thread is not threading.current_thread():
+            self._thread.join(timeout=3)

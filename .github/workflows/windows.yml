@@ -1,0 +1,35 @@
+name: Windows build and test
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          architecture: x64
+      - run: python -m pip install --disable-pip-version-check -r requirements-build.txt
+      - run: ./scripts/build.ps1
+      - name: Frozen GUI smoke
+        shell: pwsh
+        run: |
+          $profilePath = Join-Path $env:RUNNER_TEMP 'printbridge-smoke'
+          $process = Start-Process -FilePath './dist/PrintBridge.exe' -ArgumentList @('--data-dir', "`"$profilePath`"", '--smoke-test') -WindowStyle Hidden -PassThru
+          if (-not $process.WaitForExit(30000)) { $process.Kill(); throw 'GUI smoke timeout' }
+          if ($process.ExitCode -ne 0) { throw "GUI smoke failed: $($process.ExitCode)" }
+          $report = Get-Content (Join-Path $profilePath 'smoke.json') -Raw | ConvertFrom-Json
+          if (-not $report.ok -or -not $report.monitor_running -or -not $report.stopped -or $report.wechat_started) { throw 'Smoke assertions failed' }
+      - run: python scripts/build_release.py dist/PrintBridge-v1.2.0-source.zip
+      - uses: actions/upload-artifact@v4
+        with:
+          name: PrintBridge-Windows-x64
+          path: |
+            dist/PrintBridge.exe
+            dist/PrintBridge-v1.2.0-source.zip

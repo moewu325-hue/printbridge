@@ -6,6 +6,7 @@ dist/
 # Runtime
 config.json
 print_history.db
+print_history.db-*
 logs/
 temp/
 __pycache__/
@@ -31,3 +32,7 @@ desktop.ini
 # PyInstaller
 *.manifest
 *.exe
+.env
+.env.*
+*.key
+*.pem

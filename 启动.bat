@@ -2,7 +2,7 @@
 chcp 65001 >nul
 cd /d "%~dp0"
 echo ================================
-echo    PrintBridge 打印队列管理 v1.0
+echo    PrintBridge 打印队列管理 v1.2.0
 echo ================================
 echo.
 echo 启动中...

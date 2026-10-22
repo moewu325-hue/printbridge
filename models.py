@@ -29,15 +29,15 @@ class WeChatMessage:
 @dataclass
 class AppConfig:
     """应用配置(运行时从JSON加载)"""
-    selected_printer: str = "HP LaserJet Professional P1108"
+    selected_printer: str = ""
     poll_interval_sec: int = 2
-    wechat_enabled: bool = True
+    wechat_enabled: bool = False
     wechat_listen_targets: list = field(default_factory=lambda: ["文件传输助手"])
     wechat_notify_target: str = "文件传输助手"
     notify_on_complete: bool = True
     notify_on_failure: bool = True
     notify_on_error: bool = True
-    auto_print_wechat_files: bool = True
+    auto_print_wechat_files: bool = False
     allowed_file_types: list = field(default_factory=lambda: [
         "pdf", "doc", "docx", "xlsx", "pptx", "txt", "png", "jpg", "jpeg"
     ])
