@@ -1,14 +1,35 @@
 # PrintBridge
 
-Windows 桌面打印队列管理：实时查看作业、暂停/恢复/取消、系统托盘、持久历史、常驻桌面打印面板，以及可选的微信命令和通知。当前版本 **1.2.0**，Windows 10/11 x64；Python源码与单文件EXE均提供。
+Windows 桌面打印队列工作台：看清任务状态，在主窗口、托盘和桌面面板中管理打印。
+
+[![Release](https://img.shields.io/badge/release-1.2.0-blue)](https://github.com/moewu325-hue/printbridge/releases) ![Windows](https://img.shields.io/badge/Windows-10%20%2F%2011%20x64-0078D4) [![MIT](https://img.shields.io/badge/license-MIT-green)](LICENSE)
+
+PrintBridge 把队列、打印机状态和持久历史集中到一个轻量桌面工具中，适合需要持续查看打印进度、切换设备或排查异常的 Windows 用户。提供无需安装 Python 的单文件 EXE，也保留源码与 JSON 命令行入口；微信联动按需开启。
 
 ![浅色紧凑工作台，使用合成队列数据](docs/interface.png)
 
 界面图使用合成数据，展示状态筛选、文档搜索和所选任务操作。
 
-## 使用
+## 主要能力
 
-从 [Releases](https://github.com/moewu325-hue/printbridge/releases) 下载 `PrintBridge-x64.exe`，双击启动，无需安装Python。设置中选择打印机；未显式选择时使用Windows系统默认设备，不会因连接失败自动换到另一台。关闭窗口可隐藏到托盘，通过托盘显示或退出；托盘不可用时关闭窗口会退出程序。
+| 能力 | 使用方式与边界 |
+| --- | --- |
+| 队列工作台 | 实时查看作业，按状态筛选，搜索文档或提交者，操作所选任务 |
+| 打印控制 | 暂停、恢复、取消任务或清空队列；明确指定的设备不可用时不会静默换机 |
+| 持久历史 | SQLite 保存任务记录；缺纸、脱机和错误恢复后继续更新同一记录 |
+| 桌面面板 | 完整卡片与任务栏条两种模式，查看本机设备和队列，提供右键操作 |
+| 托盘常驻 | 隐藏/恢复主窗口，显示/隐藏面板，统一退出程序 |
+| 微信与 CLI | 可选微信命令/通知；源码 CLI 提供状态、队列、搜索、打印和取消的 JSON 输出 |
+
+## 快速开始
+
+1. 从 [Releases](https://github.com/moewu325-hue/printbridge/releases) 下载 `PrintBridge-x64.exe`，在 Windows 10/11 x64 双击运行。
+2. 在设置中选择打印机；留空时使用 Windows 系统默认设备。先查看队列与状态，再按需执行任务操作。
+3. 通过工具栏打开「桌面面板」，或关闭主窗口后从托盘恢复；托盘不可用时关闭窗口会退出程序。
+
+无需安装 Python。明确指定的设备不可用时不会自动换机；新安装默认关闭微信和自动文件打印，升级保留已有显式配置。
+
+## 数据与配置
 
 默认数据目录为 `%LOCALAPPDATA%\PrintBridge`，包含 `config.json`、`print_history.db`、`logs/` 和暂存文件。数据与单文件EXE解压资源分离，重启不会因临时目录清理丢失设置。可用 `PrintBridge-x64.exe --data-dir "D:\PrintBridgeData"` 或环境变量 `PRINTBRIDGE_DATA_DIR` 指定独立数据目录。首次默认启动可从EXE旁的旧配置与历史迁移，已有新目录文件不会覆盖；显式目录不自动迁入旧数据。原JSON损坏时保留原件并报告位置。
 
@@ -23,6 +44,19 @@ Windows 桌面打印队列管理：实时查看作业、暂停/恢复/取消、�
 ## 代码组织
 
 `main.py` 负责参数与错误入口，`desktop_app.py` 组合窗口和后台生命周期，`app_runtime.py` 消费后台任务；`gui/theme.py` 集中视觉样式，`gui/job_view_model.py` 独立处理队列身份、状态计数与筛选。`printer/` 管理设备/历史状态，`panel/` 提供只读快照与桌面视图，`wechat/` 隔离可选UIAutomation边界；两类界面共用打印控制。
+
+```text
+PrintBridge/
+├── main.py / desktop_app.py / app_runtime.py  # 入口与生命周期
+├── printbridge_cli.py                         # 命令行
+├── gui/                                      # 主窗口、设置与样式
+├── printer/                                  # 打印控制与历史
+├── panel/                                    # 桌面面板
+├── wechat/                                   # 可选微信适配
+├── scripts/                                  # 构建、源码发行与许可收集
+├── tests/                                    # 回归测试
+└── docs/                                     # 界面示例与验证记录
+```
 
 ## 状态的含义
 
@@ -55,12 +89,21 @@ python printbridge_cli.py --cancel 123 --printer "打印机名称" --json
 
 为避免跨账号和全盘扫描，搜索目录由 `PRINTBRIDGE_WECHAT_FILES`、`PRINTBRIDGE_SEARCH_DIRS` 显式配置；多个目录用Windows分号分隔。未配置时不扫描个人微信存储。只读CLI不创建或重写配置。
 
-## 开发与构建
+## 技术栈与源码运行
 
-Python **3.11 x64**，依赖版本见 `requirements*.txt`，没有新增服务或网络API。
+Python **3.11 x64**、Tkinter、pywin32、SQLite、pystray、Pillow；可选微信适配使用 UIAutomation/comtypes，EXE 使用 PyInstaller 打包。固定依赖见 `requirements*.txt`，没有新增服务器或网络API。
 
 ```powershell
+git clone https://github.com/moewu325-hue/printbridge.git
+cd printbridge
 python -m venv .venv
+.venv\Scripts\python -m pip install -r requirements.txt
+.venv\Scripts\python main.py
+```
+
+## 验证与构建
+
+```powershell
 .venv\Scripts\python -m pip install -r requirements-build.txt
 .venv\Scripts\python -B -m unittest discover -s tests -v
 ./scripts/build.ps1 -Python .venv\Scripts\python.exe
@@ -71,6 +114,18 @@ python -m venv .venv
 隔离GUI烟测：`dist\PrintBridge.exe --data-dir "D:\PrintBridgeSmoke" --smoke-test`，会自动退出并写该目录的 `smoke.json`；不会启动微信或提交打印操作。常规GUI测试使用真实Tk窗口对象；打印驱动和微信回归使用mock隔离副作用。Windows CI执行测试、打包及冻结入口烟测。
 
 实际验证与限制见 [docs/validation.md](docs/validation.md)。真实纸张输出、Office/PDF文件关联、微信客户端UI兼容和消息投递未验；`printto` 需要相应文件关联支持，返回成功仅表示已发起请求。
+
+现有验证记录包含本机144项测试、源码与冻结入口烟测，以及通过的 [Windows CI](https://github.com/moewu325-hue/printbridge/actions/runs/39716071499)。Explorer重启、不同厂商驱动、远程打印服务器和多显示器混合缩放尚未穷尽验证。
+
+## 常见问题
+
+**为什么窗口关闭后程序还在？** 托盘可用时关闭窗口会隐藏；从托盘菜单退出可停止程序，托盘不可用则关闭即退出。
+
+**为什么「已完成」后仍要检查打印机？** 该状态来自驱动报告，实际纸张输出仍需设备侧确认。
+
+**为什么找不到微信文件？** CLI只搜索显式配置的目录；自动附件收件暂不可用，可使用有完整路径的手动命令。
+
+**能否把数据放到其他目录？** 使用 `--data-dir` 或 `PRINTBRIDGE_DATA_DIR`；指定目录不会自动混入旧数据。
 
 ## 许可与依据
 
